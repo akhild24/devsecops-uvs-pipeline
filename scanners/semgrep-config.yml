@@ -1,0 +1,26 @@
+# Semgrep configuration for the DevSecOps UVS pipeline.
+#
+# We use the curated `p/security-audit` registry ruleset as the base (see
+# PRD Section 14 — Risks & Mitigations: curated rulesets keep the SAST
+# false-positive rate manageable), and can layer custom rules below.
+#
+# Run locally with:
+#   semgrep scan --config scanners/semgrep-config.yml --json --output semgrep.json
+rules: []
+
+# Registry rulesets pulled in via the CI workflow / CLI --config flags:
+#   p/security-audit   — general cross-language security audit ruleset
+#   p/owasp-top-ten     — OWASP Top 10 coverage
+#   p/secrets           — hardcoded credential / secret detection
+#
+# To mark a custom rule as Critical (promoted above Semgrep's native ERROR
+# level, per parsers/semgrep.py), tag it like this:
+#
+# rules:
+#   - id: hardcoded-jwt-secret
+#     languages: [python]
+#     message: Hardcoded JWT secret key detected
+#     severity: ERROR
+#     metadata:
+#       severity: CRITICAL
+#     pattern: jwt.encode($PAYLOAD, "...", ...)

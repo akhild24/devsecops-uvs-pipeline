@@ -1,0 +1,57 @@
+﻿services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: devsecops
+      POSTGRES_PASSWORD: devsecops
+      POSTGRES_DB: devsecops
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devsecops -d devsecops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://devsecops:devsecops@db:5432/devsecops}
+      KEV_BONUS: ${KEV_BONUS:-0.0}
+      DEMO_DATA_SEED: ${DEMO_DATA_SEED:-true}
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - kev_cache:/app/.cache
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  kev_cache:

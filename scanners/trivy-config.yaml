@@ -1,0 +1,30 @@
+# Trivy configuration for the DevSecOps UVS pipeline.
+# https://aquasecurity.github.io/trivy/latest/docs/references/configuration/config-file/
+#
+# Run locally with:
+#   trivy image --config scanners/trivy-config.yaml --format json --output trivy.json <image>
+
+format: json
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+  - LOW
+
+scan:
+  scanners:
+    - vuln
+    - secret
+
+vulnerability:
+  type:
+    - os
+    - library
+
+# Don't fail the CLI on findings — the UVS scoring engine decides whether to
+# block the merge, not the scanner itself.
+exit-code: 0
+
+# Cache DB locally between CI runs to keep scan time reasonable
+# (mitigation for the "slow scans on large repos" risk in the PRD).
+cache-dir: .trivy-cache

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+*.db
+
+node_modules/
+dist/
+.vite/
+
+.trivy-cache/
+backend/.cache/
+reports/
+*.egg-info/
+.env

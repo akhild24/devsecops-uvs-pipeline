@@ -1,0 +1,181 @@
+name: DevSecOps UVS Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+  SCORING_API_URL: ${{ vars.SCORING_API_URL || secrets.SCORING_API_URL || 'http://localhost:8000' }}
+  RISK_FAIL_THRESHOLD: ${{ vars.RISK_FAIL_THRESHOLD || '75' }}
+  DASHBOARD_URL: ${{ vars.DASHBOARD_URL || '' }}
+
+jobs:
+  semgrep-scan:
+    name: SAST — Semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: p/security-audit
+          generateSarif: "false"
+        continue-on-error: true
+      - name: Run Semgrep (JSON output)
+        run: |
+          pip install semgrep==1.86.0
+          semgrep scan --config p/security-audit --json --output semgrep.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep.json
+
+  owasp-scan:
+    name: SCA — OWASP Dependency-Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: "${{ github.repository }}"
+          path: "."
+          format: "JSON"
+          args: >
+            --suppression scanners/owasp-suppression.xml
+            --failOnCVSS 11
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: owasp-results
+          path: reports/dependency-check-report.json
+
+  trivy-scan:
+    name: Container Scan — Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t devsecops-target:${{ github.sha }} -f Dockerfile.backend .
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: devsecops-target:${{ github.sha }}
+          format: json
+          output: trivy.json
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy.json
+
+  score:
+    name: Aggregate & Score
+    needs: [semgrep-scan, owasp-scan, trivy-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: semgrep-results
+          path: results/
+      - uses: actions/download-artifact@v4
+        with:
+          name: owasp-results
+          path: results/
+      - uses: actions/download-artifact@v4
+        with:
+          name: trivy-results
+          path: results/
+      - name: Submit to Scoring Engine
+        run: |
+          python3 scanners/submit_scores.py \
+            --repo "${{ github.repository }}" \
+            --commit-sha "${{ github.sha }}" \
+            --environment "${{ env.ENVIRONMENT }}" \
+            --semgrep results/semgrep.json \
+            --owasp results/dependency-check-report.json \
+            --trivy results/trivy.json \
+            --api-url "${{ env.SCORING_API_URL }}" \
+            --response-file score-response.json
+      - name: Parse scoring response
+        id: score
+        run: |
+          {
+            echo "score=$(jq -r '.score' score-response.json)"
+            echo "risk_band=$(jq -r '.risk_band' score-response.json)"
+            echo "delta=$(jq -r 'if .delta_vs_previous == null then "N/A" else .delta_vs_previous end' score-response.json)"
+            echo "top_fixes=$(jq -c '.top_fixes' score-response.json)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Comment on pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7.0.1
+        env:
+          SCORE: ${{ steps.score.outputs.score }}
+          RISK_BAND: ${{ steps.score.outputs.risk_band }}
+          DELTA: ${{ steps.score.outputs.delta }}
+          TOP_FIXES: ${{ steps.score.outputs.top_fixes }}
+          DASHBOARD_URL: ${{ env.DASHBOARD_URL }}
+        with:
+          script: |
+            const marker = '<!-- uvs-risk-report -->';
+            const icons = { Low: '🟢', Medium: '🟡', High: '🟠', Critical: '🔴' };
+            const fixes = JSON.parse(process.env.TOP_FIXES || '[]');
+            const fixLines = fixes.length
+              ? fixes.map((fix) => {
+                  const target = fix.fix_known
+                    ? `upgrade **${fix.package}** to \`${fix.fixed_version}\``
+                    : `fix **${fix.package}** (fix version unknown)`;
+                  return `- ${target}: ${fix.current_score.toFixed(1)} → ${fix.simulated_score.toFixed(1)} (−${fix.score_reduction.toFixed(1)})`;
+                })
+              : ['- No package-based fixes available.'];
+            const dashboard = process.env.DASHBOARD_URL
+              ? `\n\n[Open the security dashboard](${process.env.DASHBOARD_URL})`
+              : '';
+            const body = [
+              marker,
+              `## ${icons[process.env.RISK_BAND] || '⚪'} UVS risk report`,
+              `- **Risk score:** ${process.env.SCORE}`,
+              `- **Risk band:** ${process.env.RISK_BAND}`,
+              `- **Delta vs. previous commit:** ${process.env.DELTA}`,
+              '',
+              '**Top fixes**',
+              ...fixLines,
+              dashboard,
+            ].join('\n');
+
+            try {
+              const { owner, repo } = context.repo;
+              const issue_number = context.issue.number;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              });
+              const existing = comments.find((comment) => comment.body?.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: existing.id, body,
+                });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            } catch (error) {
+              core.warning(`Could not post the UVS PR comment (fork tokens may be read-only): ${error.message}`);
+            }
+      - name: Enforce risk threshold
+        run: |
+          if ! [[ "$RISK_FAIL_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            echo "::error::RISK_FAIL_THRESHOLD must be a non-negative number."
+            exit 1
+          fi
+          if awk -v score="${{ steps.score.outputs.score }}" -v threshold="$RISK_FAIL_THRESHOLD" \
+            'BEGIN { exit !(score > threshold) }'; then
+            echo "::error::UVS score ${{ steps.score.outputs.score }} exceeds threshold $RISK_FAIL_THRESHOLD."
+            exit 1
+          fi

@@ -152,6 +152,8 @@ EPSS values come from an **offline snapshot** (`epss.json`), not a live feed. Th
 
 The workflow grants the score job `pull-requests: write` for its built-in `GITHUB_TOKEN`. On fork-originated pull requests GitHub withholds repository secrets, including `NVD_API_KEY`, so Dependency-Check fails explicitly until the scan runs in a context with that secret. GitHub may also limit the comment token on fork PRs.
 
+The Dependency-Check job excludes `.venv`, `node_modules`, `test`, and `tests` paths and disables the network-dependent Sonatype OSS Index analyzer; its NVD analyzer remains enabled. Semgrep explicitly excludes the repository-root `.venv`. Trivy scans only the backend image built from `Dockerfile.backend`, which does not copy the repository-root virtualenv.
+
 ## Demo data and sample runs
 
 The project includes repeatable demo data so the dashboard can be shown without a live scanner feed.

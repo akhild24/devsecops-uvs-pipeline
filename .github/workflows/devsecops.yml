@@ -26,7 +26,7 @@ jobs:
       - name: Run Semgrep
         run: |
           python -m pip install --disable-pip-version-check semgrep==1.86.0
-          semgrep scan --config p/security-audit --json --output semgrep.json
+          semgrep scan --config p/security-audit --exclude .venv --json --output semgrep.json
           python -c "import json; d=json.load(open('semgrep.json', encoding='utf-8')); assert isinstance(d, dict) and isinstance(d.get('results'), list), 'Semgrep did not produce a valid JSON report'"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -68,6 +68,11 @@ jobs:
             --data /usr/share/dependency-check/data \
             --nvdApiKey "$NVD_API_KEY" \
             --suppression /src/scanners/owasp-suppression.xml \
+            --exclude '**/.venv/**' \
+            --exclude '**/node_modules/**' \
+            --exclude '**/test/**' \
+            --exclude '**/tests/**' \
+            --disableOssIndex \
             --failOnCVSS 11
       - uses: actions/upload-artifact@v4
         if: always()

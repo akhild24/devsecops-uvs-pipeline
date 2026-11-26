@@ -35,7 +35,7 @@ Open <http://localhost:5173>. API docs are at <http://localhost:8000/docs>. The 
 3. **Breakdown and findings (60 sec).** Scroll to the severity breakdown. Point out the Semgrep rule/file/line and the OWASP/Trivy package findings. Explain that the sample includes `CVE-2021-44228` to demonstrate KEV matching.
 4. **What-if remediation (60 sec).** In “Fix first,” select a package fix. Show the projected score and risk band above the card; select another fix and note that this is an estimate based on removing those findings from the current scan payload.
 5. **KEV and badge (45 sec).** Point out the known-exploited flag in finding details. Open <http://localhost:8000/v1/badge/demo/acme-webapp.svg> in another tab. Say: “The SVG message and color are derived from the latest saved score.”
-6. **Pipeline (45 sec).** Show `.github/workflows/devsecops.yml`: scanners produce JSON, the score job submits it, comments on pull requests, and compares score with `RISK_FAIL_THRESHOLD`. Explain that actual GitHub comments and branch protection require repository configuration.
+6. **Pipeline (45 sec).** Show `.github/workflows/devsecops.yml`: scanners produce JSON, the score job starts FastAPI locally, records the score and findings, comments on pull requests, and fails when the score meets or exceeds `RISK_FAIL_THRESHOLD`. The reports, score, findings, and badge JSON are downloadable workflow artifacts.
 
 ## API spot checks
 
@@ -52,12 +52,28 @@ Use a commit SHA returned by the history endpoint if the sample IDs change.
 ## Known limitations
 
 - Samples are synthetic, except the Log4Shell CVE identifier used to show KEV matching; they do not represent a scan of these repositories.
-- EPSS is not part of the score. KEV score boost defaults to zero; set `KEV_BONUS` to a positive number to demonstrate an explicit boost.
+- EPSS uses the bundled offline snapshot; the default `EPSS_ALPHA` is `1.0` and the default `KEV_MULTIPLIER` is `1.25`.
 - What-if results estimate removing package findings from the saved scan and do not validate an actual dependency upgrade or rerun scanners.
-- GitHub Actions, hosted API availability, PR permissions, and branch-protection enforcement must be verified in the target GitHub repository. Fork PR tokens may prevent comments.
+- GitHub restricts PR-comment permissions for some fork-originated PRs. Branch protection must be configured in repository settings.
 - This is a faculty demo, not a production security service.
 
+## Run GitHub Actions
 
+The workflow runs on pushes to `main` and pull requests targeting `main`.
+
+1. Add the repository secret `NVD_API_KEY` under **Settings → Secrets and variables → Actions**. The Dependency-Check job uses it and caches its vulnerability data between runs.
+2. Optionally add the repository variable `RISK_FAIL_THRESHOLD` (default `75`) and `DASHBOARD_URL`.
+3. Push a commit or open/update a pull request. FastAPI starts inside the score job; it uses a job-local SQLite database, so no deployed API URL is needed.
+4. Download `semgrep-results`, `owasp-results`, and `trivy-results` for raw reports. The `score-results` artifact contains `score-response.json`, `findings-response.json`, and `risk-badge.json`.
+5. To block merges, configure branch protection or a ruleset to require the `Aggregate & Score` check. The job fails when `score >= RISK_FAIL_THRESHOLD`.
+
+The PR comment uses the job's built-in `GITHUB_TOKEN` with `pull-requests: write`. GitHub withholds repository secrets on fork-originated PRs, so Dependency-Check fails explicitly there until the scan runs in a context with `NVD_API_KEY`; fork restrictions can also prevent the comment.
+
+## What was verified
+
+- `pytest -q backend\tests`: 75 backend tests passed after the workflow and documentation changes.
+- The revised workflow YAML parses, and its embedded summary/badge JavaScript passes `node --check`.
+- A real prior workflow run ([run #3](https://github.com/akhild24/devsecops-uvs-pipeline/actions/runs/45107080297)) completed on GitHub: OWASP and Trivy succeeded, Semgrep failed during dependency installation under Python 3.14, and scoring was skipped. The revised workflow has not yet been pushed or run.
 
 ## EPSS and KEV scoring
 

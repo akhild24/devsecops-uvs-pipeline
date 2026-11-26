@@ -2,7 +2,7 @@
 
 This project demonstrates a DevSecOps pipeline that ingests raw scanner output, normalizes it, scores each commit, and visualizes the risk in a dashboard. Findings are weighted using real-world exploit signals (CISA KEV and EPSS), not just raw severity.
 
-> **Status: demo.** The backend and dashboard are tested locally. The GitHub Actions workflow has **not yet been verified against a live repository**, and the dashboard data is sample data, not live scans. See [Known limitations](#known-limitations).
+> **Status: demo.** The backend and dashboard are tested locally. GitHub Actions has run in this repository before, but the latest observed run failed before scoring; this revised workflow still needs a new GitHub run. The dashboard data is sample data, not live scans. See [Known limitations](#known-limitations).
 
 ![Dashboard screenshot](docs/dashboard.png)
 <!-- TODO: add a real screenshot at docs/dashboard.png -->
@@ -85,17 +85,17 @@ trivy image --format json --output trivy.json your-image:tag || true
 
 `|| true` keeps the command from failing on findings, so the pipeline decides pass or fail from the UVS threshold instead of the scanner exit code.
 
-The CI workflow in [.github/workflows/devsecops.yml](.github/workflows/devsecops.yml) submits scan JSON to `/v1/scan/submit` and enforces the threshold.
+The CI workflow in [.github/workflows/devsecops.yml](.github/workflows/devsecops.yml) starts a temporary local scoring API in the runner, submits scan JSON to `/v1/scan/submit`, and enforces the configured threshold.
 
 ## Dynamic risk badge
 
-When the backend is deployed, replace `YOUR_DEPLOYED_API_HOST` with its public HTTPS host. The SVG badge reflects the latest score and uses the matching risk band color:
+The workflow uploads a Shields.io-compatible `risk-badge.json` with the scored results. Download and host that JSON at a public URL to use it with Shields.io:
 
 ```markdown
-![Demo security risk](https://YOUR_DEPLOYED_API_HOST/v1/badge/demo/acme-webapp.svg)
+![Security risk](https://img.shields.io/endpoint?url=https%3A%2F%2FYOUR_HOST%2Frisk-badge.json)
 ```
 
-The local SVG endpoint is `http://localhost:8000/v1/badge/demo/acme-webapp.svg`.
+The backend also exposes a live SVG badge at `/v1/badge/{owner}/{repo}.svg` and Shields.io JSON at `/v1/badge/{owner}/{repo}`. These endpoints use the latest score stored by that backend. A local sample badge is at `http://localhost:8000/v1/badge/demo/acme-webapp.svg`.
 
 ## UVS formula
 
@@ -144,16 +144,13 @@ EPSS values come from an **offline snapshot** (`epss.json`), not a live feed. Th
 
 ## GitHub Action setup
 
-1. Push the repo to GitHub.
-2. Deploy the FastAPI backend somewhere reachable from GitHub Actions.
-3. Set repo variables / secrets:
-   - `SCORING_API_URL` = deployed backend URL, for example `https://uvs-api.example.com`
-   - `RISK_FAIL_THRESHOLD` = `75`
-   - `DASHBOARD_URL` = optional dashboard URL for PR comments
-4. Require the `Aggregate & Score` workflow check in branch protection.
-5. The score job posts a PR comment and exits with a non-zero status when the score exceeds the threshold.
+1. In **Settings → Secrets and variables → Actions**, add the repository secret `NVD_API_KEY` with an NVD API key. Dependency-Check requires it; the job caches its data directory between runs.
+2. Optionally add the repository variable `RISK_FAIL_THRESHOLD` (defaults to `75`) and `DASHBOARD_URL` (used only in the PR comment and job summary). No deployed scoring service or `SCORING_API_URL` is needed: the score job starts FastAPI on the runner and uses SQLite for that job.
+3. Push to `main` or open/update a pull request targeting `main` to run the workflow. It uploads each raw scanner report and a `score-results` artifact containing the score response, complete findings breakdown, and Shields.io badge JSON.
+4. The score job fails when `score >= RISK_FAIL_THRESHOLD`. In **Settings → Branches → Branch protection rules** (or the applicable ruleset), require the `Aggregate & Score` status check to block merges.
+5. On pull requests, the job creates or updates one report comment with the score, severity, and top Fix first items, including whether each is in CISA KEV.
 
-Fork-originated pull requests may not have permission to publish comments even when the workflow declares `pull-requests: write`; GitHub restricts fork tokens. The workflow reports that situation as a warning, while the score threshold check still runs.
+The workflow grants the score job `pull-requests: write` for its built-in `GITHUB_TOKEN`. On fork-originated pull requests GitHub withholds repository secrets, including `NVD_API_KEY`, so Dependency-Check fails explicitly until the scan runs in a context with that secret. GitHub may also limit the comment token on fork PRs.
 
 ## Demo data and sample runs
 
@@ -166,13 +163,18 @@ The project includes repeatable demo data so the dashboard can be shown without 
 ## Known limitations
 
 - This is a demo project, not a production-grade enterprise platform.
-- **The GitHub Actions workflow has not yet been run against a live repository.** Real scanner execution requires a live GitHub repo, a deployed backend URL, and branch protection configuration.
+- The latest observed GitHub Actions run (#3, November 23, 2026) had successful OWASP and Trivy jobs but failed while installing Semgrep: the runner selected Python 3.14, which was incompatible with the installed `pydantic-core` build dependencies. The score job was skipped. This revision pins Python 3.11 for Semgrep and runs scoring in-job, but it has not yet been pushed and rerun on GitHub.
 - The seeded findings are representative sample data, not live scan output from real repositories.
 - Demo CVE IDs use the `CVE-DEMO-*` namespace; the Log4Shell sample uses the real `CVE-2021-44228` identifier to demonstrate KEV matching. None of these are a claim that the sample repositories were scanned.
 - EPSS data is an offline snapshot and is not refreshed automatically.
-- Reachability analysis is not implemented. Findings are scored whether or not the vulnerable code is actually reachable.
 - The submit endpoint has no authentication yet.
 - The project is intended for teaching and presentation, not large-scale multi-org scanning.
+
+## What was verified
+
+- `pytest -q backend\tests`: 75 backend tests passed after the workflow and documentation changes.
+- The revised workflow YAML parses, and its embedded summary/badge JavaScript passes `node --check`.
+- GitHub Actions run [#3](https://github.com/akhild24/devsecops-uvs-pipeline/actions/runs/45107080297) is a real prior run of the repository workflow: OWASP and Trivy succeeded, Semgrep failed during dependency installation, and scoring did not run. The revised workflow still needs a fresh GitHub-hosted run.
 
 ## Repository layout
 

@@ -6,9 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
-  SCORING_API_URL: ${{ vars.SCORING_API_URL || secrets.SCORING_API_URL || 'http://localhost:8000' }}
   RISK_FAIL_THRESHOLD: ${{ vars.RISK_FAIL_THRESHOLD || '75' }}
   DASHBOARD_URL: ${{ vars.DASHBOARD_URL || '' }}
 
@@ -18,40 +20,61 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run Semgrep
-        uses: semgrep/semgrep-action@v1
+      - uses: actions/setup-python@v5
         with:
-          config: p/security-audit
-          generateSarif: "false"
-        continue-on-error: true
-      - name: Run Semgrep (JSON output)
+          python-version: "3.11"
+      - name: Run Semgrep
         run: |
-          pip install semgrep==1.86.0
-          semgrep scan --config p/security-audit --json --output semgrep.json || true
+          python -m pip install --disable-pip-version-check semgrep==1.86.0
+          semgrep scan --config p/security-audit --json --output semgrep.json
+          python -c "import json; d=json.load(open('semgrep.json', encoding='utf-8')); assert isinstance(d, dict) and isinstance(d.get('results'), list), 'Semgrep did not produce a valid JSON report'"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: semgrep-results
           path: semgrep.json
+          if-no-files-found: error
 
   owasp-scan:
     name: SCA — OWASP Dependency-Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run OWASP Dependency-Check
-        uses: dependency-check/Dependency-Check_Action@main
+      - name: Restore Dependency-Check data
+        uses: actions/cache@v4
         with:
-          project: "${{ github.repository }}"
-          path: "."
-          format: "JSON"
-          args: >
-            --suppression scanners/owasp-suppression.xml
+          path: ${{ runner.temp }}/dependency-check-data
+          key: dependency-check-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            dependency-check-${{ runner.os }}-
+      - name: Run OWASP Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          if [ -z "$NVD_API_KEY" ]; then
+            echo "::error::Set the NVD_API_KEY repository secret before running this workflow."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/dependency-check-data" reports
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v "$RUNNER_TEMP/dependency-check-data:/usr/share/dependency-check/data" \
+            owasp/dependency-check:12.1.0 \
+            --project "$GITHUB_REPOSITORY" \
+            --scan /src \
+            --format JSON \
+            --out /src/reports \
+            --data /usr/share/dependency-check/data \
+            --nvdApiKey "$NVD_API_KEY" \
+            --suppression /src/scanners/owasp-suppression.xml \
             --failOnCVSS 11
-        continue-on-error: true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: owasp-results
           path: reports/dependency-check-report.json
+          if-no-files-found: error
 
   trivy-scan:
     name: Container Scan — Trivy
@@ -68,10 +91,14 @@ jobs:
           output: trivy.json
           severity: "CRITICAL,HIGH,MEDIUM,LOW"
           exit-code: "0"
+          trivy-config: scanners/trivy-config.yaml
+          cache-dir: .trivy-cache
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: trivy-results
           path: trivy.json
+          if-no-files-found: error
 
   score:
     name: Aggregate & Score
@@ -82,41 +109,119 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: semgrep-results
-          path: results/
-      - uses: actions/download-artifact@v4
+          python-version: "3.11"
+      - name: Download scanner reports
+        uses: actions/download-artifact@v4
         with:
-          name: owasp-results
+          pattern: "*-results"
           path: results/
-      - uses: actions/download-artifact@v4
-        with:
-          name: trivy-results
-          path: results/
-      - name: Submit to Scoring Engine
+          merge-multiple: true
+      - name: Start scoring engine
+        working-directory: backend
+        env:
+          DATABASE_URL: sqlite:////tmp/uvs-ci.db
+          DEMO_DATA_SEED: "false"
         run: |
-          python3 scanners/submit_scores.py \
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/uvs-api.log 2>&1 &
+          echo $! > /tmp/uvs-api.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health; then
+              echo
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/uvs-api.log
+          echo "::error::Scoring engine did not become healthy."
+          exit 1
+      - name: Submit reports to scoring engine
+        run: |
+          python scanners/submit_scores.py \
             --repo "${{ github.repository }}" \
             --commit-sha "${{ github.sha }}" \
             --environment "${{ env.ENVIRONMENT }}" \
             --semgrep results/semgrep.json \
             --owasp results/dependency-check-report.json \
             --trivy results/trivy.json \
-            --api-url "${{ env.SCORING_API_URL }}" \
+            --api-url http://127.0.0.1:8000 \
             --response-file score-response.json
-      - name: Parse scoring response
+          curl --fail --silent --show-error \
+            "http://127.0.0.1:8000/v1/breakdown/${{ github.sha }}" \
+            --output findings-response.json
+      - name: Prepare score summary and badge
         id: score
+        env:
+          DASHBOARD_URL: ${{ env.DASHBOARD_URL }}
         run: |
-          {
-            echo "score=$(jq -r '.score' score-response.json)"
-            echo "risk_band=$(jq -r '.risk_band' score-response.json)"
-            echo "delta=$(jq -r 'if .delta_vs_previous == null then "N/A" else .delta_vs_previous end' score-response.json)"
-            echo "top_fixes=$(jq -c '.top_fixes' score-response.json)"
-          } >> "$GITHUB_OUTPUT"
+          node <<'NODE'
+          const fs = require('fs');
+          const response = JSON.parse(fs.readFileSync('score-response.json', 'utf8'));
+          const findings = JSON.parse(fs.readFileSync('findings-response.json', 'utf8'));
+          const score = Number(response.score);
+          const riskBand = response.risk_band;
+          if (!Number.isFinite(score) || !riskBand) {
+            throw new Error('Scoring API response is missing a valid score or risk band.');
+          }
+
+          const colors = {
+            Low: 'brightgreen',
+            Medium: 'yellow',
+            High: 'orange',
+            Critical: 'red',
+          };
+          const badge = {
+            schemaVersion: 1,
+            label: 'security risk',
+            message: `${score.toFixed(1)} ${riskBand}`,
+            color: colors[riskBand] || 'lightgrey',
+          };
+          fs.writeFileSync('risk-badge.json', `${JSON.stringify(badge, null, 2)}\n`);
+
+          const fixes = response.top_fixes || [];
+          const escapeMarkdown = (value) => String(value ?? '')
+            .replace(/[\\`*_{}[\]()#+.!|>-]/g, '\\$&');
+          const fixLines = fixes.length
+            ? fixes.map((fix) => {
+                const action = fix.fix_known
+                  ? `upgrade **${escapeMarkdown(fix.package)}** to \`${escapeMarkdown(fix.fixed_version)}\``
+                  : `fix **${escapeMarkdown(fix.package)}** (fix version unknown)`;
+                const kev = fix.known_exploited ? ' — **CISA KEV: Yes**' : ' — CISA KEV: No';
+                return `- ${action}: ${fix.current_score.toFixed(1)} → ${fix.simulated_score.toFixed(1)} (−${fix.score_reduction.toFixed(1)})${kev}`;
+              })
+            : ['- No package-based fixes available.'];
+          const summary = [
+            '# DevSecOps UVS scan',
+            '',
+            `- **Risk score:** ${score.toFixed(1)}`,
+            `- **Severity:** ${riskBand}`,
+            `- **Commit:** \`${process.env.GITHUB_SHA}\``,
+            `- **Findings:** ${findings.findings.length}`,
+            '',
+            '## Fix first',
+            ...fixLines,
+            '',
+            'The Shields.io-compatible badge is attached as `risk-badge.json` in the `score-results` artifact.',
+            '',
+          ];
+          if (process.env.DASHBOARD_URL) {
+            summary.push(`[Open the security dashboard](${process.env.DASHBOARD_URL})`, '');
+          }
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary.join('\n')}\n`);
+
+          const output = [
+            `score=${score}`,
+            `risk_band=${riskBand}`,
+            `delta=${response.delta_vs_previous ?? 'N/A'}`,
+            `top_fixes=${JSON.stringify(fixes)}`,
+          ];
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `${output.join('\n')}\n`);
+          NODE
       - name: Comment on pull request
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7.0.1
+        uses: actions/github-script@v7
         env:
           SCORE: ${{ steps.score.outputs.score }}
           RISK_BAND: ${{ steps.score.outputs.risk_band }}
@@ -127,13 +232,16 @@ jobs:
           script: |
             const marker = '<!-- uvs-risk-report -->';
             const icons = { Low: '🟢', Medium: '🟡', High: '🟠', Critical: '🔴' };
+            const escapeMarkdown = (value) => String(value ?? '')
+              .replace(/[\\`*_{}[\]()#+.!|>-]/g, '\\$&');
             const fixes = JSON.parse(process.env.TOP_FIXES || '[]');
             const fixLines = fixes.length
               ? fixes.map((fix) => {
                   const target = fix.fix_known
-                    ? `upgrade **${fix.package}** to \`${fix.fixed_version}\``
-                    : `fix **${fix.package}** (fix version unknown)`;
-                  return `- ${target}: ${fix.current_score.toFixed(1)} → ${fix.simulated_score.toFixed(1)} (−${fix.score_reduction.toFixed(1)})`;
+                    ? `upgrade **${escapeMarkdown(fix.package)}** to \`${escapeMarkdown(fix.fixed_version)}\``
+                    : `fix **${escapeMarkdown(fix.package)}** (fix version unknown)`;
+                  const kev = fix.known_exploited ? ' — **CISA KEV: Yes**' : ' — CISA KEV: No';
+                  return `- ${target}: ${fix.current_score.toFixed(1)} → ${fix.simulated_score.toFixed(1)} (−${fix.score_reduction.toFixed(1)})${kev}`;
                 })
               : ['- No package-based fixes available.'];
             const dashboard = process.env.DASHBOARD_URL
@@ -143,10 +251,10 @@ jobs:
               marker,
               `## ${icons[process.env.RISK_BAND] || '⚪'} UVS risk report`,
               `- **Risk score:** ${process.env.SCORE}`,
-              `- **Risk band:** ${process.env.RISK_BAND}`,
+              `- **Severity:** ${process.env.RISK_BAND}`,
               `- **Delta vs. previous commit:** ${process.env.DELTA}`,
               '',
-              '**Top fixes**',
+              '**Fix first**',
               ...fixLines,
               dashboard,
             ].join('\n');
@@ -168,6 +276,15 @@ jobs:
             } catch (error) {
               core.warning(`Could not post the UVS PR comment (fork tokens may be read-only): ${error.message}`);
             }
+      - name: Upload scored results
+        uses: actions/upload-artifact@v4
+        with:
+          name: score-results
+          path: |
+            score-response.json
+            findings-response.json
+            risk-badge.json
+          if-no-files-found: error
       - name: Enforce risk threshold
         run: |
           if ! [[ "$RISK_FAIL_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -175,7 +292,7 @@ jobs:
             exit 1
           fi
           if awk -v score="${{ steps.score.outputs.score }}" -v threshold="$RISK_FAIL_THRESHOLD" \
-            'BEGIN { exit !(score > threshold) }'; then
-            echo "::error::UVS score ${{ steps.score.outputs.score }} exceeds threshold $RISK_FAIL_THRESHOLD."
+            'BEGIN { exit !(score >= threshold) }'; then
+            echo "::error::UVS score ${{ steps.score.outputs.score }} meets or exceeds threshold $RISK_FAIL_THRESHOLD."
             exit 1
           fi
